@@ -1,0 +1,244 @@
+---
+title: "Adaptive Mixed-Model Selection Report (v2.0)"
+subtitle: "Evidence-based model selection: Gaussian LMM / Gamma GLMM / Log-normal LMM, scored jointly against configurable weighted criteria"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+params:
+  batch_results: NA   # output of run_adaptive_model_selection_batch()
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 4)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# -----------------------------------------------------------------------
+# This report expects an object called `batch_results` in the environment
+# (or passed via rmarkdown::render(params = list(batch_results = ...))) -
+# the return value of run_adaptive_model_selection_batch() from
+# run_adaptive_model_selection_v2.R.
+#
+# Typical usage:
+#   batch_results <- run_adaptive_model_selection_batch(
+#     datamatrix            = my_data,
+#     measurement_variables  = c("meas1", "meas2"),
+#     comparison_parameter   = "treatment",
+#     confounder_vars        = c("plateID", "batchNo")
+#   )
+#   rmarkdown::render(
+#     "LmmGmm_adaptive_model_selection_Report_v2_0.Rmd",
+#     params = list(batch_results = batch_results),
+#     output_file = "adaptive_model_selection_report.html"
+#   )
+# -----------------------------------------------------------------------
+if (is.null(params$batch_results) || (length(params$batch_results) == 1 && is.na(params$batch_results))) {
+  if (!exists("batch_results")) {
+    stop("No `batch_results` found. Either pass params = list(batch_results = ...) to rmarkdown::render(), ",
+         "or have an object called `batch_results` in the environment before knitting.")
+  }
+  batch_results <- get("batch_results", envir = .GlobalEnv)
+} else {
+  batch_results <- params$batch_results
+}
+
+# -----------------------------------------------------------------------
+# .safe_kable() builds the table but does NOT print it - .print_html()
+# below is what actually emits it into the document, wrapped as an
+# explicit pandoc raw-HTML block ("```{=html} ... ```").
+# -----------------------------------------------------------------------
+.safe_kable <- function(df, font_size = 12, ...) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    kable(...) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, font_size = font_size)
+}
+
+.print_html <- function(x) {
+  if (is.null(x)) { cat("_Nothing to display._\n\n"); return(invisible(NULL)) }
+  cat("\n```{=html}\n")
+  cat(as.character(x))
+  cat("\n```\n\n")
+}
+
+format_pval <- function(p) {
+  if (is.null(p) || length(p) == 0 || is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  as.character(signif(p, 3))
+}
+```
+
+## Overview
+
+This report walks through the v2.0 evidence-based model-selection engine applied to each measurement variable. Instead of a sequential decision tree, every structurally feasible candidate (Gaussian LMM always; Gamma GLMM and Log-normal LMM additionally if the response is strictly positive) is fitted and evaluated independently. Any fixed-slope candidate whose primary residual diagnostic fails is also refit with random slopes and, if that refit converges and is non-singular, scored alongside the rest as an independent candidate. Every surviving candidate accumulates evidence from raw-data characteristics, model performance (R²/ICC), residual diagnostics, and fit stability, weighted according to `model_selection_weights` (see `scoring.R`); the candidate with the highest total evidence score is selected for downstream inference. Hard exclusions (non-convergence, singularity, structural infeasibility) are the only reason a candidate is dropped outright - residual diagnostics are weighted evidence, never a pass/fail gate.
+
+### Final model chosen per measurement
+
+```{r final-summary, results="asis"}
+.print_html(.safe_kable(batch_results$final_summary, font_size = 12))
+```
+
+## 1. Raw data assessment
+
+### Sample sizes
+
+Per-group and total complete-case sample sizes actually used for fitting (after removing rows with missing values in the response, treatment, or grouping variables), computed once per measurement before any per-family positivity filtering.
+
+```{r sample-size-table, results="asis"}
+.print_html(.safe_kable(batch_results$sample_size_table, font_size = 11))
+```
+
+Distributional characteristics of each response variable, computed once before any model is fitted. `Best_empirical_fit` is the distribution (Normal/Gamma/Log-normal) with the highest Akaike weight from a structure-free `fitdistrplus` fit on the raw values - informative prior evidence, not the inferential model itself.
+
+```{r raw-data-table, results="asis"}
+.print_html(.safe_kable(batch_results$raw_data_table, font_size = 11))
+```
+
+## 2. Candidate models
+
+Every candidate that was fitted per measurement (including any random-slopes rescue attempts), whether it converged, whether it was singular, and - if excluded - why. Only structural failures lead to exclusion here; a candidate with poor residual diagnostics is NOT excluded, it simply scores lower in Section 5.
+
+```{r candidate-table, results="asis"}
+.print_html(.safe_kable(batch_results$candidate_table, font_size = 11))
+```
+
+## 3. Model performance
+
+AIC, BIC, marginal R², conditional R², and ICC for every non-excluded candidate. Log-normal AIC/BIC include the Jacobian correction so they are comparable to Gaussian/Gamma on the response scale. These metrics feed the evidence score in Section 5 (R²/ICC directly; AIC/BIC are reported here for context but are not themselves weighted criteria - see the raw-data "empirical fit" evidence in Section 1/5 instead).
+
+```{r performance-table, results="asis"}
+.print_html(.safe_kable(batch_results$performance_table, font_size = 11))
+```
+
+## 4. Residual diagnostics
+
+Shapiro-Wilk (Gaussian candidates) or DHARMa KS-uniformity / dispersion / outlier tests (Gamma & Log-normal candidates), for every non-excluded candidate. `DHARMa_Seed` is the random seed drawn for that candidate's simulation - no seed is fixed across runs, but recording it here means this exact result can be reproduced later by calling `set.seed()` with that value before re-fitting.
+
+```{r residual-table, results="asis"}
+if (is.null(batch_results$residual_table) || nrow(batch_results$residual_table) == 0) {
+  cat("_Nothing to display._\n\n")
+} else {
+  .print_html(.safe_kable(batch_results$residual_table %>%
+                             mutate(across(where(is.numeric), ~ ifelse(is.na(.), NA, round(., 4)))),
+                           font_size = 11))
+}
+```
+
+## 5. Evidence scores
+
+The full weighted-evidence breakdown per candidate: each criterion's raw sub-score (already scaled 0-1, higher = better) contributing to `Total_evidence`. Excluded candidates show `NA` here - they were never scored, only recorded with their exclusion reason.
+
+```{r evidence-table, results="asis"}
+if (is.null(batch_results$comparison_table) || nrow(batch_results$comparison_table) == 0) {
+  cat("_Nothing to display._\n\n")
+} else {
+  .print_html(.safe_kable(batch_results$comparison_table %>% select(-matches("_pts$")), font_size = 10))
+}
+```
+
+### 5b. Ranking, margins, and where points were won or lost
+
+The same candidates, ranked by `Total_evidence` (best first), with `Trail_behind_best` (how far behind the winner) and `Lead_over_next` (the margin over the very next candidate - this is the "first vs. second place" gap). The `*_pts` columns are the actual weighted point contribution of each criterion (raw sub-score x its rescaled weight) - reading across a row shows exactly which criteria a candidate earned its points from, and comparing two rows column-by-column shows exactly where one candidate lost ground relative to another (e.g. two candidates can be nearly tied on R²/ICC and split apart entirely on `residual_diagnostics_pts`).
+
+```{r score-gap-table, results="asis"}
+if (is.null(batch_results$score_gap_table) || nrow(batch_results$score_gap_table) == 0) {
+  cat("_No score-gap table available._\n\n")
+} else {
+  for (meas in unique(batch_results$score_gap_table$Measurement)) {
+    cat("#### ", meas, "\n\n")
+    sub <- batch_results$score_gap_table %>% filter(Measurement == meas) %>% select(-Measurement)
+    .print_html(.safe_kable(sub, font_size = 10))
+  }
+}
+```
+
+## 6. Automatic model selection summary
+
+An automatically generated rationale per measurement, describing the raw-data characteristics, which candidates were fitted/excluded, and why the winning candidate had the strongest evidence.
+
+```{r decision-summary, results="asis"}
+if (is.null(batch_results$decision_summary_table) || nrow(batch_results$decision_summary_table) == 0) {
+  cat("_No decision summaries available._\n\n")
+} else {
+  for (i in seq_len(nrow(batch_results$decision_summary_table))) {
+    cat(paste0("**", batch_results$decision_summary_table$Measurement[i], "**"), "\n\n")
+    cat(batch_results$decision_summary_table$Decision_summary[i], "\n\n")
+  }
+}
+```
+
+## 7. Scoring / audit log
+
+Every fit attempt, random-slopes rescue attempt, and scoring-time warning (e.g. a criterion that was unavailable for a candidate and had its weight redistributed among the remaining available criteria), in order, per measurement. This is the full audit trail behind every table above.
+
+```{r scoring-log-per-measurement, results="asis"}
+if (!is.null(batch_results$scoring_log) && nrow(batch_results$scoring_log) > 0) {
+  for (meas in unique(batch_results$scoring_log$Measurement)) {
+    cat("#### ", meas, "\n\n")
+    sub <- batch_results$scoring_log %>% filter(Measurement == meas) %>% select(-Measurement)
+    .print_html(.safe_kable(sub, font_size = 11))
+  }
+}
+```
+
+## 8. Diagnostic plots
+
+QQ-plot and residuals-vs-fitted for whichever candidate was ultimately selected per measurement (raw residuals for Gaussian LMMs, DHARMa scaled residuals for Gamma GLMM / Log-normal LMM).
+
+```{r diagnostic-plots, results="asis", fig.width=9, fig.height=4}
+if (length(batch_results$diagnostics_plots) == 0) {
+  cat("_No diagnostic plots available._\n\n")
+} else {
+  for (meas in names(batch_results$diagnostics_plots)) {
+    cat("#### ", meas, "\n\n")
+    print(batch_results$diagnostics_plots[[meas]])
+    cat("\n\n")
+  }
+}
+```
+
+## 9. Fixed-effect significance
+
+Type III test of the comparison-parameter effect for the final selected model per measurement. Satterthwaite F-test (Gaussian / Log-normal LMM) or Wald Chi-square test (Gamma GLMM), matching each family's own convention.
+
+```{r anova-table, results="asis"}
+.print_html(.safe_kable(batch_results$anova_table, font_size = 11))
+```
+
+## 10. Pairwise post-hoc comparisons
+
+All pairwise contrasts between treatment groups from the final selected model, via `emmeans` - or, if `defined_contrasts` was supplied to `run_adaptive_model_selection_batch()`, only the explicitly requested comparisons (e.g. matched inner/middle/outer pairs rather than every possible pair). For Gamma GLMM / Log-normal LMM these are reported on the response scale (ratio of means / geometric means). P-values are adjusted for multiple comparisons across whichever set (all-pairs or defined) was actually run. Check Section 7 (scoring/audit log) for any requested comparison that had to be skipped because one of its levels wasn't present for that particular measurement.
+
+```{r pairwise-table, results="asis"}
+.print_html(.safe_kable(batch_results$pairwise_table, font_size = 11))
+```
+
+## 11. Random-effect variance components and ICC
+
+Variance attributable to each grouping variable relative to total variance, for the final selected model per measurement.
+
+```{r icc-table, results="asis"}
+.print_html(.safe_kable(batch_results$random_eff_table, font_size = 12))
+```
+
+## 12. Supplementary statistics table
+
+One consolidated table, one row per pairwise contrast, combining everything typically needed for a manuscript's supplementary statistics table: the selected model, total sample size, the omnibus (Type III) test, R²/ICC, and the contrast's effect size and test statistic (each unified into one column - `ratio`/`t.ratio` for Gaussian/Log-normal candidates, `estimate`/`z.ratio` for Gamma GLMM, since GLMM contrasts are asymptotic Wald z-tests rather than t-tests). `Contrast_df` is left blank for z-tests rather than showing `Inf` - a t-distribution with infinite df is the normal distribution, so `df = Inf` is mathematically correct but isn't standard practice to report, and writing a literal `Inf` to Excel produces a `#NUM!` error. The `Caveat` column flags any measurement where model selection was a fallback (only one structurally feasible candidate) or where the selected model's own residual diagnostics indicated a poor fit despite winning the comparison - worth checking before reporting a measurement's statistics without qualification.
+
+```{r supplementary-table, results="asis"}
+.print_html(.safe_kable(batch_results$supplementary_table, font_size = 10))
+```
+
+## Notes on interpretation
+
+- **Candidates are excluded only for structural reasons** (failure to converge, singular fit, or - for a random-slopes rescue attempt - an inadequate group-count-to-parameter ratio). Poor residual diagnostics never exclude a candidate; they simply reduce its `residual_diagnostics` evidence contribution in Section 5. Biological datasets rarely produce textbook-perfect residual behaviour, so a candidate with imperfect but not-worst diagnostics can still win if it's stronger elsewhere (R², stability, raw-data fit).
+- **A measurement with only one non-excluded candidate** (e.g. Gaussian is the only structurally feasible option because the response isn't strictly positive, or every alternative was singular) is "selected" by default - check Section 2 to see whether that's actually a meaningful comparison or a fallback.
+- **Random-slopes candidates** only appear in Sections 2-5 if a fixed-slope candidate of the same family failed its primary residual diagnostic (`alpha` in the batch call) AND the random-slopes refit converged, was non-singular, and had adequate group counts relative to its variance/covariance parameters. If a rescue attempt was tried and dropped, that's logged in Section 7 (audit log) but the dropped candidate itself does not appear in Sections 2-5.
+- **Missing/unavailable criteria** (e.g. Shapiro-Wilk not computed for n > 5000, or a DHARMa test failing to simulate) have their weight share redistributed among the remaining available criteria for that candidate, and a warning documenting this is recorded in Section 7 - check there if a candidate's `Total_evidence` in Section 5 looks lower than expected.
+- **The scoring weights are hard-coded** in `model_selection_weights` (`scoring.R`), not read from an external config - retuning them means editing that file directly (or passing an overriding `weights` list into `run_adaptive_model_selection_batch()` for a single run).
